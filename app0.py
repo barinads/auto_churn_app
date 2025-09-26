@@ -319,63 +319,7 @@ X_full = df_fe.drop(columns=["Exited"])
 X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True).reindex(columns=feature_cols, fill_value=0)
 proba_full = rf.predict_proba(X_full_rf)[:,1]
 pred_full  = (proba_full >= th).astype(int)
-# =======================================================
-# Decide which table to SCORE: live CSV (preferred) or training (demo)
-# =======================================================
-if live_file is not None:
-    df_live = pd.read_csv(live_file)
-    st.success(f"Loaded {len(df_live):,} customers to score.")
-else:
-    st.info("No live CSV uploaded — scoring the training file (demo).")
-    df_live = df_raw.copy()
 
-# Keep CustomerId for output if present
-cust_ids = (
-    df_live["CustomerId"]
-    if "CustomerId" in df_live.columns
-    else pd.Series(range(len(df_live)), name="CustomerId")
-)
-
-# Build modeling copy for scoring: drop IDs → feature engineer → cap outliers
-drop_cols = [c for c in ["RowNumber", "Surname", "CustomerId"] if c in df_live.columns]
-df_live_model = df_live.drop(columns=drop_cols, errors="ignore")
-df_live_fe, _cat_tmp, num_tmp = featurize(df_live_model)
-df_live_fe = iqr_cap(df_live_fe, num_tmp)
-
-# Design matrix aligned to TRAINING columns
-X_score = df_live_fe.drop(columns=[c for c in ["Exited"] if c in df_live_fe.columns])
-X_score_rf = pd.get_dummies(X_score, columns=cat_cols, drop_first=True)
-X_score_rf = X_score_rf.reindex(columns=feature_cols, fill_value=0)
-
-# Predict with trained RF at current threshold
-proba_score = rf.predict_proba(X_score_rf)[:, 1]
-pred_score  = (proba_score >= th).astype(int)
-
-# Threshold metrics (only if labels exist in the CURRENT scored dataset)
-st.subheader(f"Model summary (threshold = {th:.2f})")
-if "Exited" in df_live_fe.columns:
-    st.json(summarize(df_live_fe["Exited"], pred_score, proba_score))
-else:
-    st.caption("Live file has no labels; precision/recall aren’t computed here.")
-
-# Predictions DF used by the rest of the app
-pred_df = df_live_fe.copy()
-pred_df["ChurnProb"] = proba_score
-pred_df["ChurnPred"] = pred_score
-pred_df["CustomerId"] = cust_ids.values
-
-
-st.subheader(f"Model summary (threshold = {th:.2f})")
-if "Exited" in df_fe.columns:
-    st.json(summarize(df_fe["Exited"], pred_full, proba_full))
-else:
-    st.info("Labels not available to compute metrics at current threshold.")
-
-# Predictions DF
-pred_df = df_fe.copy()
-pred_df["ChurnProb"] = proba_full
-pred_df["ChurnPred"] = pred_full
-pred_df["CustomerId"] = df_raw["CustomerId"]
 
 # ---------- Sidebar: catalog + controls ----------
 with st.sidebar:
