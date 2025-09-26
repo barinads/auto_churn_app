@@ -110,9 +110,9 @@ def summarize(y_true, y_pred, proba) -> dict:
 # ------------------------------
 def _to_float_price(v):
     """Parse numeric price from strings like '$32,500', '€45.9k', etc."""
-    if pd.isna(v): 
+    if pd.isna(v):
         return np.nan
-    if isinstance(v, (int, float)): 
+    if isinstance(v, (int, float)):
         return float(v)
     s = str(v).lower().replace('k','000')
     s = re.sub(r'[^0-9.\-]', '', s)
@@ -259,6 +259,37 @@ def suggest_car_randomized(customer: pd.Series, cars: pd.DataFrame,
         pick = near.sample(1).iloc[0]["car_name"]
     return pick
 
+# ---------- NEW: helpers to read & score any dataset ----------
+def _read_any(file):
+    name = getattr(file, "name", "")
+    if str(name).lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(file)
+    return pd.read_csv(file)
+
+def score_raw_customers(raw_df: pd.DataFrame, th: float) -> pd.DataFrame:
+    """
+    Take a raw-like customers df (same columns as data.csv, 'Exited' optional),
+    engineer features exactly like training, align columns to the model,
+    predict churn prob at threshold th, and return a dataframe with predictions.
+    """
+    cust_ids = raw_df["CustomerId"].values if "CustomerId" in raw_df.columns else np.arange(len(raw_df))
+    df_model = raw_df.drop(columns=["RowNumber", "Surname", "CustomerId"], errors="ignore")
+    df_fe_local, _, num_cols_local = featurize(df_model)
+    df_fe_local = iqr_cap(df_fe_local, num_cols_local)
+
+    X_up = df_fe_local.drop(columns=["Exited"], errors="ignore")
+    # uses global cat_cols/feature_cols defined later
+    X_up_rf = pd.get_dummies(X_up, columns=cat_cols, drop_first=True)
+    X_up_rf = X_up_rf.reindex(columns=feature_cols, fill_value=0)
+
+    proba = rf.predict_proba(X_up_rf)[:, 1]
+    pred  = (proba >= th).astype(int)
+
+    df_fe_local["CustomerId"] = cust_ids
+    df_fe_local["ChurnProb"]  = proba
+    df_fe_local["ChurnPred"]  = pred
+    return df_fe_local
+
 # ------------------------------
 # Caching layers
 # ------------------------------
@@ -300,7 +331,7 @@ def fit_model(X, y, cat_cols):
 # ------------------------------
 st.title("Churn Prediction → Car Suggestions")
 
-# Load data
+# Load data + model
 df_raw, df_model = load_data()
 df_fe, X_all, y_all, cat_cols = prepare_data(df_model)
 rf, feature_cols, metrics, split_objs = fit_model(X_all, y_all, cat_cols)
@@ -309,8 +340,8 @@ rf, feature_cols, metrics, split_objs = fit_model(X_all, y_all, cat_cols)
 SAL_P10 = float(df_fe["EstimatedSalary"].quantile(0.10))
 SAL_P90 = float(df_fe["EstimatedSalary"].quantile(0.90))
 
-
-
+st.subheader("Model (Random Forest) — quick summary")
+st.write(metrics)
 
 with st.expander("Preview customer data (engineered)"):
     st.dataframe(df_fe.head(10))
@@ -319,7 +350,7 @@ with st.expander("Preview customer data (engineered)"):
 st.subheader("Choose churn threshold")
 th = st.slider("Decision threshold for P(churn)", min_value=0.05, max_value=0.95, value=0.30, step=0.01)
 
-# Prepare full design matrix and predict
+# Prepare full design matrix and predict on all rows of data.csv
 X_full = df_fe.drop(columns=["Exited"])
 X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True)
 X_full_rf = X_full_rf.reindex(columns=feature_cols, fill_value=0)
@@ -331,49 +362,85 @@ pred_full  = (proba_full >= th).astype(int)
 st.subheader(f"Model summary (threshold = {th:.2f})")
 if "Exited" in df_fe.columns:
     metrics_at_th = summarize(df_fe["Exited"], pred_full, proba_full)
-    st.json(metrics_at_th)     # pretty JSON at top
+    st.json(metrics_at_th)
 else:
     st.info("Labels not available to compute metrics at the current threshold.")
 
-# Attach predictions back to a copy for display
+# Attach predictions back to a copy for display (for the base data.csv)
 pred_df = df_fe.copy()
 pred_df["ChurnProb"] = proba_full
 pred_df["ChurnPred"] = pred_full
-# Bring back CustomerId (kept only in raw)
-pred_df["CustomerId"] = df_raw["CustomerId"]
+pred_df["CustomerId"] = df_raw["CustomerId"]  # bring back id
 
-# Car suggestions (derive labels inside app)
+# ==========================================
+# PICK WHO TO TARGET  +  (optional) UPLOAD
+# ==========================================
+X_train, X_test, y_train, y_test = split_objs
+
+st.subheader("Who should we target?")
+scope = st.radio(
+    "Population to score/display",
+    ["All customers (data.csv)", "Hold-out test only", "Training only", "Upload a file"],
+    index=0,
+    horizontal=False
+)
+exclude_churned = st.checkbox("Exclude customers who already churned (Exited = 1)", value=True)
+
+pred_df_source = None
+
+if scope == "Upload a file":
+    up = st.file_uploader("Upload current customers (.csv or .xlsx) with the same columns as data.csv", type=["csv","xlsx","xls"])
+    if up is not None:
+        try:
+            raw_up = _read_any(up)
+            pred_df_source = score_raw_customers(raw_up, th)
+            st.success(f"Uploaded file read: {raw_up.shape[0]} rows.")
+        except Exception as e:
+            st.error(f"Could not read or score the uploaded file: {e}")
+else:
+    # use the already-scored base table
+    if scope == "Hold-out test only":
+        pred_df_source = pred_df.loc[X_test.index].copy()
+    elif scope == "Training only":
+        pred_df_source = pred_df.loc[X_train.index].copy()
+    else:
+        pred_df_source = pred_df.copy()
+
+# optionally exclude historically churned customers if labels exist
+if exclude_churned and "Exited" in pred_df_source.columns:
+    pred_df_source = pred_df_source[pred_df_source["Exited"] == 0]
+
+# filter at-risk
+churners = pred_df_source[pred_df_source["ChurnPred"] == 1].copy()
+
+# ------------------------------
+# Cars + suggestions + display
+# ------------------------------
 st.subheader("Car suggestions for at-risk customers")
 cars = load_and_label_cars("auto_combined_updated.xlsx")
 
-# (optional) sanity preview of derived labels
 with st.expander("Cars: derived labels preview"):
     st.write("Segment counts:", cars["segment"].value_counts(dropna=False))
     st.write("Style counts:", cars["style"].value_counts(dropna=False))
     st.dataframe(cars[["car_name","segment","style","price_numeric"]].head(20))
 
-churners = pred_df[pred_df["ChurnPred"] == 1].copy()
 if churners.empty:
-    st.info("No churn-risk customers at this threshold.")
+    st.info("No churn-risk customers for the selected population & threshold.")
 else:
     churners["SuggestedCar"] = churners.apply(
-        lambda r: suggest_car_randomized(r, cars, SAL_P10, SAL_P90, topk=5, tie_eps=0.03, per_customer_random=True),
+        lambda r: suggest_car_randomized(r, cars, SAL_P10, SAL_P90,
+                                         topk=5, tie_eps=0.03, per_customer_random=True),
         axis=1
     )
-    # strictly drop rows with no match
     churners = churners[churners["SuggestedCar"].notna()]
 
-    # columns to show
     show_cols = ["CustomerId", "Geography", "Gender", "Age", "AgeBucket",
                  "EstimatedSalary", "ChurnProb", "SuggestedCar"]
     show_cols = [c for c in show_cols if c in churners.columns]
     st.dataframe(churners[show_cols].sort_values("ChurnProb", ascending=False).head(50))
 
     # Download button
-    out_cols = ["CustomerId", "Geography", "Gender", "Age", "AgeBucket",
-                "EstimatedSalary", "ChurnProb", "SuggestedCar"]
-    out_cols = [c for c in out_cols if c in churners.columns]
-    out = churners[out_cols].sort_values("ChurnProb", ascending=False).reset_index(drop=True)
+    out = churners[show_cols].sort_values("ChurnProb", ascending=False).reset_index(drop=True)
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         out.to_excel(writer, index=False, sheet_name="churn_car_suggestions")
