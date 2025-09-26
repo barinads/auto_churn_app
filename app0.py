@@ -1,14 +1,15 @@
+# app0.py  — Churn → Car Suggestions (merged with flexible catalog loader)
+
 import io
 import re
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    classification_report, roc_auc_score, accuracy_score,
-    precision_recall_fscore_support
-)
+from sklearn.metrics import accuracy_score, roc_auc_score, precision_recall_fscore_support
 from sklearn.ensemble import RandomForestClassifier
 
 # ------------------------------
@@ -16,38 +17,28 @@ from sklearn.ensemble import RandomForestClassifier
 # ------------------------------
 RSEED = 42
 st.set_page_config(page_title="Churn → Car Suggestions", layout="wide")
+DEFAULT_CARS_XLSX = "auto_combined_updated.xlsx"   # you can upload a file instead (see sidebar)
 
-# ------------------------------
-# Feature Engineering (same for train & predict)
-# ------------------------------
+# =======================================================
+# 1) Churn model: feature engineering + helpers (unchanged)
+# =======================================================
 def featurize(df: pd.DataFrame) -> tuple[pd.DataFrame, list, list]:
-    """Return engineered df (copy), cat_cols, num_cols."""
     df = df.copy()
-
-    # Flags & ratios
     df["BalancePositive"] = (df["Balance"] > 0).astype(int)
     df["Senior"] = (df["Age"] >= 60).astype(int)
     df["YoungAdult"] = ((df["Age"] >= 18) & (df["Age"] <= 30)).astype(int)
-    df["Bal_Salary_Ratio"] = np.where(
-        df["EstimatedSalary"] > 0, df["Balance"] / df["EstimatedSalary"], 0.0
-    )
+    df["Bal_Salary_Ratio"] = np.where(df["EstimatedSalary"] > 0, df["Balance"] / df["EstimatedSalary"], 0.0)
 
-    # Buckets
     df["CreditBucket"] = pd.cut(
-        df["CreditScore"],
-        [-np.inf, 500, 650, 750, np.inf],
+        df["CreditScore"], [-np.inf, 500, 650, 750, np.inf],
         labels=["very_low", "low", "mid", "high"]
     ).astype(str)
-
     df["AgeBucket"] = pd.cut(
-        df["Age"],
-        [-np.inf, 25, 35, 45, 55, 65, np.inf],
+        df["Age"], [-np.inf, 25, 35, 45, 55, 65, np.inf],
         labels=["<=25", "26-35", "36-45", "46-55", "56-65", "65+"]
     ).astype(str)
-
     df["TenureBucket"] = pd.cut(
-        df["Tenure"],
-        [-np.inf, 1, 3, 5, 7, 9, np.inf],
+        df["Tenure"], [-np.inf, 1, 3, 5, 7, 9, np.inf],
         labels=["<=1", "2-3", "4-5", "6-7", "8-9", "10+"]
     ).astype(str)
 
@@ -56,7 +47,6 @@ def featurize(df: pd.DataFrame) -> tuple[pd.DataFrame, list, list]:
     return df, cat_cols, num_cols
 
 def iqr_cap(df: pd.DataFrame, num_cols: list) -> pd.DataFrame:
-    """Winsorize numerics by IQR caps."""
     df = df.copy()
     for c in num_cols:
         q1, q3 = df[c].quantile(0.25), df[c].quantile(0.75)
@@ -66,27 +56,16 @@ def iqr_cap(df: pd.DataFrame, num_cols: list) -> pd.DataFrame:
     return df
 
 def ohe_align(train_df: pd.DataFrame, test_df: pd.DataFrame, cat_cols: list):
-    """One-hot encode + align columns."""
     Xtr = pd.get_dummies(train_df, columns=cat_cols, drop_first=True)
     Xte = pd.get_dummies(test_df,  columns=cat_cols, drop_first=True)
     Xte = Xte.reindex(columns=Xtr.columns, fill_value=0)
     return Xtr, Xte
 
-# ------------------------------
-# Model helpers
-# ------------------------------
 def train_rf(X_train, y_train):
-    """Train a solid RF quickly (fixed params to keep the app snappy)."""
     rf = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=10,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        max_features="sqrt",
-        bootstrap=True,
-        class_weight="balanced",
-        n_jobs=-1,
-        random_state=RSEED
+        n_estimators=500, max_depth=10, min_samples_split=2, min_samples_leaf=1,
+        max_features="sqrt", bootstrap=True, class_weight="balanced",
+        n_jobs=-1, random_state=RSEED
     )
     rf.fit(X_train, y_train)
     return rf
@@ -97,207 +76,12 @@ def summarize(y_true, y_pred, proba) -> dict:
         y_true, y_pred, average="binary", zero_division=0
     )
     auc = roc_auc_score(y_true, proba)
-    return {
-        "Accuracy": round(acc, 3),
-        "Churn Precision": round(prec, 3),
-        "Churn Recall": round(rec, 3),
-        "Churn F1": round(f1, 3),
-        "ROC AUC": round(auc, 3),
-    }
+    return {"Accuracy": round(acc, 3), "Churn Precision": round(prec, 3),
+            "Churn Recall": round(rec, 3), "Churn F1": round(f1, 3), "ROC AUC": round(auc, 3)}
 
-# ------------------------------
-# Car labeling (derive from price/brand/body_type) + strict suggestions
-# ------------------------------
-def _to_float_price(v):
-    """Parse numeric price from strings like '$32,500', '€45.9k', etc."""
-    if pd.isna(v):
-        return np.nan
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).lower().replace('k','000')
-    s = re.sub(r'[^0-9.\-]', '', s)
-    try:
-        return float(s)
-    except:
-        return np.nan
-
-@st.cache_data
-def load_and_label_cars(path: str,
-                        price_bins=(0, 30_000, 70_000, float('inf')),
-                        price_labels=("Economy", "Mid", "Luxury")) -> pd.DataFrame:
-    """
-    Load Excel, normalize columns, derive:
-      - price_numeric
-      - segment (Economy/Mid/Luxury) from price; fallback by brand tier
-      - style (Sport/Family/Compact/General) from body_style/name
-      - impute missing price_numeric via segment→brand median, segment median, overall median
-    """
-    cars = pd.read_excel(path)
-    cars.columns = [c.lower() for c in cars.columns]
-
-    # Identify likely columns
-    price_col = next((c for c in ["car_price","price","msrp","listing_price","sale_price","retail_price"] if c in cars.columns), None)
-    body_col  = next((c for c in ["body_style","body_type","body","vehicle_type","class","category"] if c in cars.columns), None)
-    brand_col = next((c for c in ["brand","make","manufacturer","marque","company"] if c in cars.columns), None)
-    name_col  = "car_name" if "car_name" in cars.columns else (next((c for c in ["name","model","title"] if c in cars.columns), None))
-
-    if name_col is None:
-        cars["car_name"] = cars.index.astype(str)
-        name_col = "car_name"
-
-    # 1) price_numeric
-    if price_col:
-        cars["price_numeric"] = cars[price_col].map(_to_float_price)
-    else:
-        cars["price_numeric"] = np.nan
-
-    # 2) segment from price bins
-    cars["segment"] = pd.cut(cars["price_numeric"], bins=price_bins, labels=price_labels, include_lowest=True)
-
-    # 3) backfill segment by brand tier if missing
-    if brand_col:
-        brand = cars[brand_col].astype(str).str.strip().str.title()
-        luxury_brands  = {"Audi","Bmw","Mercedes-Benz","Mercedes","Lexus","Infiniti","Acura","Volvo",
-                          "Jaguar","Land Rover","Porsche","Maserati","Genesis","Cadillac","Lincoln",
-                          "Alfa Romeo","Tesla","Bentley","Rolls-Royce","Aston Martin"}
-        economy_brands = {"Toyota","Honda","Hyundai","Kia","Nissan","Renault","Peugeot","Citroen",
-                          "Skoda","Seat","Dacia","Fiat","Opel","Vauxhall","Chevrolet","Ford","Mazda",
-                          "Subaru","Suzuki","Mitsubishi","Volkswagen","Vw","Buick","Dodge","Chrysler",
-                          "Ram","Pontiac","Saab","Holden"}
-        def brand_to_segment(b):
-            if b in luxury_brands:  return "Luxury"
-            if b in economy_brands: return "Economy"
-            return None
-        cars["_brand_seg"] = brand.map(brand_to_segment)
-        cars["segment"] = cars["segment"].astype(object).fillna(cars["_brand_seg"])
-
-    # 4) style from body / name cues
-    body_text = cars[body_col].astype(str).str.lower() if body_col else pd.Series("", index=cars.index)
-    name_text = cars[name_col].astype(str).str.lower()
-
-    sport_kw   = r"(?:^|\W)(sport|gt|gti|rs|sti|m |amg|type r|nismo|vrs|gr |srt|cupra|n line)(?:\W|$)"
-    family_kw  = r"suv|crossover|mpv|minivan|van|wagon|estate"
-    compact_kw = r"hatch|compact|subcompact|city"
-
-    style = pd.Series("General", index=cars.index, dtype=object)
-    # sporty by body/name badges
-    style[name_text.str.contains(sport_kw, regex=True) | body_text.str.contains(r"coupe|roadster|cabrio|convertible")] = "Sport"
-    # family by body
-    style[body_text.str.contains(family_kw, regex=True)] = "Family"
-    # compact by body
-    style[body_text.str.contains(compact_kw, regex=True)] = "Compact"
-    cars["style"] = style
-
-    # 5) impute missing price_numeric for better ranking
-    cars["segment"] = cars["segment"].astype(str).str.title()
-    if brand_col:
-        cars["brand_clean"] = cars[brand_col].astype(str).str.title()
-    else:
-        cars["brand_clean"] = "Unknown"
-
-    cars["price_numeric"] = pd.to_numeric(cars["price_numeric"], errors="coerce")
-    # by segment + brand
-    cars["price_numeric"] = cars.groupby(["segment","brand_clean"])["price_numeric"]\
-                                .transform(lambda s: s.fillna(s.median()))
-    # by segment
-    cars["price_numeric"] = cars.groupby("segment")["price_numeric"]\
-                                .transform(lambda s: s.fillna(s.median()))
-    # overall
-    cars["price_numeric"] = cars["price_numeric"].fillna(cars["price_numeric"].median())
-
-    # Keep essentials first
-    lead = [c for c in ["car_name", "segment", "style", "price_numeric", body_col, brand_col] if c in cars.columns]
-    cars = cars[lead + [c for c in cars.columns if c not in lead]]
-    return cars
-
-def suggest_car_randomized(customer: pd.Series, cars: pd.DataFrame,
-                           sal_p10: float, sal_p90: float,
-                           topk: int = 5, tie_eps: float = 0.03,
-                           per_customer_random: bool = True) -> str | None:
-    """
-    STRICT selection (segment+style), randomize among near-ties.
-    - Salary is clamped to [P10, P90] for realistic segmenting/budget.
-    - topk: limit near-tie pool size.
-    - tie_eps: cars within ±3% of best score count as ties.
-    - per_customer_random: stable randomness seeded by CustomerId.
-    """
-    salary = float(np.clip(customer["EstimatedSalary"], sal_p10, sal_p90))
-    age_bucket = str(customer.get("AgeBucket", ""))
-
-    # salary → segment
-    need_segment = "Economy" if salary < 50_000 else ("Mid" if salary < 150_000 else "Luxury")
-
-    # age → preferred styles
-    if age_bucket in ["<=25", "26-35"]:
-        styles = ["Sport", "Compact"]
-    elif age_bucket in ["46-55", "56-65", "65+"]:
-        styles = ["Family", "General"]
-    else:
-        styles = ["General", "Compact", "Family", "Sport"]
-
-    pool = cars[(cars["segment"] == need_segment) & (cars["style"].isin(styles))]
-    if pool.empty:
-        return None
-
-    # score by closeness to budget
-    budget = 0.6 * salary
-    pool = pool.assign(score = - (pool["price_numeric"] - budget).abs())
-    ranked = pool.sort_values("score", ascending=False)
-    best = ranked.iloc[0]["score"]
-    # gather near-ties
-    near = ranked[ranked["score"] >= best - abs(best) * tie_eps]
-    if near.empty:
-        near = ranked.head(topk)
-    else:
-        near = near.head(max(topk, len(near)))
-
-    # randomized pick (stable per customer unless you set per_customer_random=False)
-    if per_customer_random:
-        seed = int(customer.get("CustomerId", 0)) % (2**32 - 1)
-        pick = near.sample(1, random_state=seed).iloc[0]["car_name"]
-    else:
-        pick = near.sample(1).iloc[0]["car_name"]
-    return pick
-
-# ---------- NEW: helpers to read & score any dataset ----------
-def _read_any(file):
-    name = getattr(file, "name", "")
-    if str(name).lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(file)
-    return pd.read_csv(file)
-
-def score_raw_customers(raw_df: pd.DataFrame, th: float) -> pd.DataFrame:
-    """
-    Take a raw-like customers df (same columns as data.csv, 'Exited' optional),
-    engineer features exactly like training, align columns to the model,
-    predict churn prob at threshold th, and return a dataframe with predictions.
-    """
-    cust_ids = raw_df["CustomerId"].values if "CustomerId" in raw_df.columns else np.arange(len(raw_df))
-    df_model = raw_df.drop(columns=["RowNumber", "Surname", "CustomerId"], errors="ignore")
-    df_fe_local, _, num_cols_local = featurize(df_model)
-    df_fe_local = iqr_cap(df_fe_local, num_cols_local)
-
-    X_up = df_fe_local.drop(columns=["Exited"], errors="ignore")
-    # uses global cat_cols/feature_cols defined later
-    X_up_rf = pd.get_dummies(X_up, columns=cat_cols, drop_first=True)
-    X_up_rf = X_up_rf.reindex(columns=feature_cols, fill_value=0)
-
-    proba = rf.predict_proba(X_up_rf)[:, 1]
-    pred  = (proba >= th).astype(int)
-
-    df_fe_local["CustomerId"] = cust_ids
-    df_fe_local["ChurnProb"]  = proba
-    df_fe_local["ChurnPred"]  = pred
-    return df_fe_local
-
-# ------------------------------
-# Caching layers
-# ------------------------------
 @st.cache_data
 def load_data():
-    # Keep raw for CustomerId & display; build modeling df from it
-    df_raw = pd.read_csv("data.csv")
-    # drop only non-predictive IDs from modeling copy
+    df_raw = pd.read_csv("data.csv")                     # keep CustomerId in raw
     df = df_raw.drop(columns=["RowNumber", "Surname", "CustomerId"])
     return df_raw, df
 
@@ -316,29 +100,203 @@ def fit_model(X, y, cat_cols):
     )
     X_train_rf, X_test_rf = ohe_align(X_train, X_test, cat_cols)
     rf = train_rf(X_train_rf, y_train)
-
-    # Evaluate
     proba_test = rf.predict_proba(X_test_rf)[:, 1]
     pred_test = (proba_test >= 0.50).astype(int)
     metrics = summarize(y_test, pred_test, proba_test)
-
-    # Save feature names for later alignment on full data
     feature_cols = X_train_rf.columns.tolist()
-    return rf, feature_cols, metrics, (X_train, X_test, y_train, y_test)
+    return rf, feature_cols, metrics
 
-# ------------------------------
-# UI
-# ------------------------------
+# =======================================================
+# 2) Car catalog loader + suggestion logic (from your code)
+# =======================================================
+def _first_present(columns: list[str], candidates: list[str]) -> Optional[str]:
+    for cand in candidates:
+        if cand in columns:
+            return cand
+    return None
+
+def _coerce_price(series: pd.Series) -> pd.Series:
+    if series.dtype.kind in {"i", "u", "f"}:
+        return pd.to_numeric(series, errors="coerce")
+    cleaned = series.astype(str).str.replace(r"[^0-9,\.]", "", regex=True)
+    use_dot = cleaned.str.contains(r"\.")
+    cleaned = np.where(use_dot, cleaned.str.replace(",", "", regex=False),
+                       cleaned.str.replace(".", "", regex=False))
+    cleaned = pd.Series(cleaned).str.replace(",", ".", regex=False)
+    return pd.to_numeric(cleaned, errors="coerce")
+
+@st.cache_data(show_spinner=False)
+def load_cars_from_any(path_or_file) -> Tuple[pd.DataFrame, dict]:
+    if hasattr(path_or_file, "read"):
+        cars = pd.read_excel(path_or_file)
+    else:
+        src = str(path_or_file)
+        cars = pd.read_excel(src) if src.lower().endswith((".xlsx", ".xls")) else pd.read_csv(src)
+
+    cars = cars.copy()
+    cars.columns = [c.strip() for c in cars.columns]
+    lower = [c.lower() for c in cars.columns]
+    cars.rename(columns=dict(zip(cars.columns, lower)), inplace=True)
+    cols = cars.columns.tolist()
+
+    seg_col = _first_present(cols, ["segment","class","category","market_segment","kategori","segmento","seg"])
+    if seg_col is None:
+        st.error("Cars file must include a segment/class/category column.")
+        st.stop()
+
+    style_col = _first_present(
+        cols, ["style","body","type","body_type","bodytype","bodystyle","body_style","kasa","kasa tipi","kasa_tipi","gövde","govde","tip","tipi"]
+    )
+    if style_col is None:
+        st.error("Cars file must include a style/body/type column.")
+        st.stop()
+
+    name_col = _first_present(cols, ["car_name","name","model","title","arac","araç","model_adi","model adı"])
+    if name_col is None:
+        maybe_brand = _first_present(cols, ["brand","make"])
+        maybe_model = _first_present(cols, ["model","variant","trim"])
+        if maybe_brand and maybe_model:
+            cars["car_name"] = cars[maybe_brand].astype(str).str.strip().str.title() + " " + \
+                               cars[maybe_model].astype(str).str.strip().str.title()
+            name_col = "car_name"
+        else:
+            cars["car_name"] = cars.index.astype(str)
+            name_col = "car_name"
+
+    brand_col = _first_present(cols, ["brand","make"])
+    if brand_col is None:
+        cars["brand"] = cars[name_col].astype(str).str.strip().str.split().str[0].str.title()
+        brand_col = "brand"
+    else:
+        cars["brand"] = cars[brand_col].astype(str).str.strip().str.title()
+
+    price_col = _first_present(cols, ["price_numeric","price","msrp","list_price","fiyat","sale_price"])
+    if price_col is not None:
+        cars["price_numeric"] = _coerce_price(cars[price_col])
+
+    seg_map = {"luxary":"Luxury","luxury":"Luxury","premium":"Luxury",
+               "economy":"Economy","eko":"Economy","economic":"Economy",
+               "mid":"Mid","middle":"Mid","medium":"Mid"}
+    style_map = {"family":"Family","general":"General","sport":"Sport","compact":"Compact",
+                 "sedan":"General","hatchback":"Compact","suv":"Family","crossover":"Family"}
+
+    def norm_segment(x: str) -> str:
+        x_clean = str(x).strip().lower()
+        return seg_map.get(x_clean, x_clean.title())
+
+    def tokenize_styles(x: str) -> list[str]:
+        raw = str(x).strip().lower()
+        parts = raw.replace("/", " ").replace(",", " ").replace("-", " ").split()
+        norm = []
+        for t in parts:
+            t_map = style_map.get(t, t.title())
+            if t_map not in norm:
+                norm.append(t_map)
+        return norm or [raw.title()]
+
+    cars["segment"] = cars[seg_col].apply(norm_segment)
+    cars["style"] = cars[style_col].astype(str).str.strip().str.title()
+    cars["style_tokens"] = cars["style"].apply(tokenize_styles)
+    cars["car_name"] = cars[name_col].astype(str).str.strip()
+
+    mapping = {"segment": seg_col, "style": style_col, "car_name": name_col,
+               "brand": brand_col, "price_numeric": price_col}
+    return cars, mapping
+
+def suggest_car(
+    age: int,
+    estimated_salary: float,
+    cars: pd.DataFrame,
+    *,
+    topk: int = 5,
+    tie_eps: float = 0.05,
+    per_user_seed: Optional[int] = None,
+    diversify_noise: float = 0.02,
+    exclude_brands: Optional[list[str]] = None,
+    avoid_consecutive_same_brand: bool = True,
+) -> Optional[pd.Series]:
+    # age bucket
+    if age <= 25:      age_bucket = "<=25"
+    elif age <= 35:    age_bucket = "26-35"
+    elif age <= 45:    age_bucket = "36-45"
+    elif age <= 55:    age_bucket = "46-55"
+    elif age <= 65:    age_bucket = "56-65"
+    else:              age_bucket = "65+"
+
+    # salary → segment
+    need_segment = "Economy" if estimated_salary < 50_000 else ("Mid" if estimated_salary < 150_000 else "Luxury")
+
+    # age → preferred styles
+    if age_bucket in ["<=25", "26-35"]:
+        styles = ["Sport", "Compact"]
+    elif age_bucket in ["46-55", "56-65", "65+"]:
+        styles = ["Family", "General"]
+    else:
+        styles = ["General", "Compact", "Family", "Sport"]
+
+    def style_match(tokens: list[str], wanted: list[str]) -> bool:
+        return any(t in wanted for t in tokens)
+
+    pool = cars[(cars["segment"] == need_segment) & (cars["style_tokens"].apply(lambda t: style_match(t, styles)))]
+    if exclude_brands and "brand" in pool.columns:
+        pool = pool[~pool["brand"].isin([b.title() for b in exclude_brands])]
+
+    if pool.empty:
+        pool = cars[cars["segment"] == need_segment]
+    if pool.empty:
+        pool = cars[cars["style_tokens"].apply(lambda t: style_match(t, styles))]
+    if pool.empty:
+        pool = cars
+
+    if "price_numeric" in pool.columns and pool["price_numeric"].notna().any():
+        budget = 0.6 * float(estimated_salary)
+        priced_mask = pool["price_numeric"].notna()
+        base = pd.Series(index=pool.index, dtype=float)
+        base.loc[priced_mask] = -(pool.loc[priced_mask, "price_numeric"] - budget).abs()
+        base.loc[~priced_mask] = -abs(budget) * 0.05
+        score = base
+    else:
+        score = pd.Series(0.0, index=pool.index)
+
+    if diversify_noise > 0:
+        rng = np.random.default_rng(per_user_seed)
+        score = score + rng.normal(0, diversify_noise, size=len(score))
+
+    ranked = pool.assign(score=score).sort_values("score", ascending=False)
+    if ranked.empty:
+        return None
+
+    best = ranked.iloc[0]["score"]
+    near = ranked[ranked["score"] >= best - abs(best) * tie_eps]
+    if near.empty:
+        near = ranked.head(max(1, topk))
+    else:
+        near = near.head(max(topk, len(near)))
+
+    # avoid same brand consecutively inside a session (not across rows)
+    cand = near
+    if avoid_consecutive_same_brand and "brand" in near.columns:
+        last_brand = st.session_state.get("last_suggested_brand")
+        if last_brand is not None:
+            alt = near[near["brand"] != last_brand]
+            if not alt.empty:
+                cand = alt
+
+    pick = cand.sample(1, random_state=per_user_seed).iloc[0] if per_user_seed is not None else cand.sample(1).iloc[0]
+    if avoid_consecutive_same_brand and "brand" in near.columns:
+        st.session_state["last_suggested_brand"] = pick.get("brand")
+
+    return pick
+
+# =======================================================
+# 3) UI / flow
+# =======================================================
 st.title("Churn Prediction → Car Suggestions")
 
-# Load data + model
+# Load + fit
 df_raw, df_model = load_data()
 df_fe, X_all, y_all, cat_cols = prepare_data(df_model)
-rf, feature_cols, metrics, split_objs = fit_model(X_all, y_all, cat_cols)
-
-# Salary clamps for realistic segmenting/budget
-SAL_P10 = float(df_fe["EstimatedSalary"].quantile(0.10))
-SAL_P90 = float(df_fe["EstimatedSalary"].quantile(0.90))
+rf, feature_cols, metrics = fit_model(X_all, y_all, cat_cols)
 
 st.subheader("Model (Random Forest) — quick summary")
 st.write(metrics)
@@ -346,109 +304,100 @@ st.write(metrics)
 with st.expander("Preview customer data (engineered)"):
     st.dataframe(df_fe.head(10))
 
-# Threshold selection
+# Churn threshold
 st.subheader("Choose churn threshold")
-th = st.slider("Decision threshold for P(churn)", min_value=0.05, max_value=0.95, value=0.30, step=0.01)
+th = st.slider("Decision threshold for P(churn)", 0.05, 0.95, 0.30, 0.01)
 
-# Prepare full design matrix and predict on all rows of data.csv
+# Predict on all rows
 X_full = df_fe.drop(columns=["Exited"])
-X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True)
-X_full_rf = X_full_rf.reindex(columns=feature_cols, fill_value=0)
-
+X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True).reindex(columns=feature_cols, fill_value=0)
 proba_full = rf.predict_proba(X_full_rf)[:, 1]
-pred_full  = (proba_full >= th).astype(int)
+pred_full = (proba_full >= th).astype(int)
 
-# === Threshold-aware summary (current slider) ===
+# Live metrics at threshold
 st.subheader(f"Model summary (threshold = {th:.2f})")
 if "Exited" in df_fe.columns:
-    metrics_at_th = summarize(df_fe["Exited"], pred_full, proba_full)
-    st.json(metrics_at_th)
+    st.json(summarize(df_fe["Exited"], pred_full, proba_full))
 else:
     st.info("Labels not available to compute metrics at the current threshold.")
 
-# Attach predictions back to a copy for display (for the base data.csv)
+# Attach predictions back
 pred_df = df_fe.copy()
 pred_df["ChurnProb"] = proba_full
 pred_df["ChurnPred"] = pred_full
-pred_df["CustomerId"] = df_raw["CustomerId"]  # bring back id
+pred_df["CustomerId"] = df_raw["CustomerId"]
 
-# ==========================================
-# PICK WHO TO TARGET  +  (optional) UPLOAD
-# ==========================================
-X_train, X_test, y_train, y_test = split_objs
+# ---------- Sidebar controls for catalog ----------
+with st.sidebar:
+    st.subheader("Car catalog")
+    uploaded = st.file_uploader("Upload Excel/CSV", type=["xlsx","xls","csv"])
+    use_default = st.checkbox("Use default file", value=True, help=DEFAULT_CARS_XLSX)
+    path_input = st.text_input("Or path", value=DEFAULT_CARS_XLSX if use_default else "")
 
-st.subheader("Who should we target?")
-scope = st.radio(
-    "Population to score/display",
-    ["All customers (data.csv)", "Hold-out test only", "Training only", "Upload a file"],
-    index=0,
-    horizontal=False
+    st.markdown("---")
+    st.subheader("Suggestion controls")
+    ui_topk = st.slider("Top-K pool", 1, 20, 5, 1)
+    ui_tie = st.slider("Near-tie window (± of best)", 0.0, 0.25, 0.05, 0.01)
+    ui_noise = st.slider("Diversify noise (σ)", 0.0, 0.1, 0.02, 0.005)
+
+# Load cars
+source = uploaded if uploaded is not None else (path_input if path_input.strip() else None)
+if source is None:
+    st.info("Upload a car catalog or set a path in the sidebar to generate suggestions.")
+    st.stop()
+
+cars, mapping = load_cars_from_any(source)
+st.caption(
+    f"Mapped columns — segment: `{mapping['segment']}`, style: `{mapping['style']}`, "
+    f"name: `{mapping['car_name']}`, brand: `{mapping['brand'] or 'derived'}`, "
+    f"price: `{mapping['price_numeric'] or 'none'}`"
 )
-exclude_churned = st.checkbox("Exclude customers who already churned (Exited = 1)", value=True)
+with st.expander("Cars: catalog preview"):
+    st.dataframe(cars.head(20))
 
-pred_df_source = None
-
-if scope == "Upload a file":
-    up = st.file_uploader("Upload current customers (.csv or .xlsx) with the same columns as data.csv", type=["csv","xlsx","xls"])
-    if up is not None:
-        try:
-            raw_up = _read_any(up)
-            pred_df_source = score_raw_customers(raw_up, th)
-            st.success(f"Uploaded file read: {raw_up.shape[0]} rows.")
-        except Exception as e:
-            st.error(f"Could not read or score the uploaded file: {e}")
-else:
-    # use the already-scored base table
-    if scope == "Hold-out test only":
-        pred_df_source = pred_df.loc[X_test.index].copy()
-    elif scope == "Training only":
-        pred_df_source = pred_df.loc[X_train.index].copy()
-    else:
-        pred_df_source = pred_df.copy()
-
-# optionally exclude historically churned customers if labels exist
-if exclude_churned and "Exited" in pred_df_source.columns:
-    pred_df_source = pred_df_source[pred_df_source["Exited"] == 0]
-
-# filter at-risk
-churners = pred_df_source[pred_df_source["ChurnPred"] == 1].copy()
-
-# ------------------------------
-# Cars + suggestions + display
-# ------------------------------
+# Build suggestions for churners
 st.subheader("Car suggestions for at-risk customers")
-cars = load_and_label_cars("auto_combined_updated.xlsx")
-
-with st.expander("Cars: derived labels preview"):
-    st.write("Segment counts:", cars["segment"].value_counts(dropna=False))
-    st.write("Style counts:", cars["style"].value_counts(dropna=False))
-    st.dataframe(cars[["car_name","segment","style","price_numeric"]].head(20))
-
+churners = pred_df[pred_df["ChurnPred"] == 1].copy()
 if churners.empty:
-    st.info("No churn-risk customers for the selected population & threshold.")
+    st.info("No churn-risk customers at this threshold.")
 else:
-    churners["SuggestedCar"] = churners.apply(
-        lambda r: suggest_car_randomized(r, cars, SAL_P10, SAL_P90,
-                                         topk=5, tie_eps=0.03, per_customer_random=True),
-        axis=1
-    )
+    # optional brand exclusions selector (dynamic based on catalog)
+    all_brands = sorted(cars["brand"].dropna().unique().tolist()) if "brand" in cars.columns else []
+    ui_exclude = st.multiselect("Exclude brands", options=all_brands, default=[])
+
+    def row_to_suggestion(row):
+        seed = int(row["CustomerId"]) if "CustomerId" in row else None
+        pick = suggest_car(
+            age=int(row["Age"]),
+            estimated_salary=float(row["EstimatedSalary"]),
+            cars=cars,
+            topk=ui_topk,
+            tie_eps=ui_tie,
+            per_user_seed=seed,
+            diversify_noise=ui_noise,
+            exclude_brands=ui_exclude,
+            avoid_consecutive_same_brand=False,  # avoid cross-row coupling
+        )
+        return None if pick is None else pick.get("car_name")
+
+    churners["SuggestedCar"] = churners.apply(row_to_suggestion, axis=1)
     churners = churners[churners["SuggestedCar"].notna()]
 
     show_cols = ["CustomerId", "Geography", "Gender", "Age", "AgeBucket",
                  "EstimatedSalary", "ChurnProb", "SuggestedCar"]
     show_cols = [c for c in show_cols if c in churners.columns]
-    st.dataframe(churners[show_cols].sort_values("ChurnProb", ascending=False).head(50))
+    st.dataframe(churners[show_cols].sort_values("ChurnProb", ascending=False).head(50), use_container_width=True)
 
-    # Download button
+    # Download suggestions
     out = churners[show_cols].sort_values("ChurnProb", ascending=False).reset_index(drop=True)
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         out.to_excel(writer, index=False, sheet_name="churn_car_suggestions")
     st.download_button(
-        label="Download suggestions (Excel)",
+        "Download suggestions (Excel)",
         data=buffer.getvalue(),
         file_name="churn_customers_with_car_suggestions.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-st.caption("Tip: lower the threshold to increase recall (catch more churners), raise it to increase precision.")
+st.caption("Tip: Lower the threshold to increase recall (catch more churners); raise it to increase precision.")
