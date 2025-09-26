@@ -295,8 +295,8 @@ df_raw, df_model = load_data()
 df_fe, X_all, y_all, cat_cols = prepare_data(df_model)
 rf, feature_cols, metrics = fit_model(X_all, y_all, cat_cols)
 
-st.subheader("Model (Random Forest) — quick summary")
-st.write(metrics)
+#st.subheader("Model (Random Forest) — quick summary")
+#st.write(metrics)
 
 with st.expander("Preview customer data (engineered)"):
     st.dataframe(df_fe.head(10))
@@ -354,7 +354,7 @@ with st.expander("Cars: catalog preview"):
 # =======================================================
 # NEW: Single-customer quick recommendations
 # =======================================================
-st.subheader("Single-customer quick recommendations")
+st.subheader("quick recommendations")
 
 cc1, cc2, cc3, cc4 = st.columns([1,1,1,1])
 with cc1:
