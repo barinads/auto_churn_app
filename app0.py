@@ -1,4 +1,3 @@
-# app0.py — Churn → Car Suggestions (now with single-customer recommender)
 
 import io
 import re
@@ -255,7 +254,6 @@ def suggest_cars_for_person(age: int, salary: float, cars: pd.DataFrame, *,
                             diversify_noise: float = 0.02, per_user_seed: Optional[int] = None,
                             exclude_brands: Optional[list[str]] = None) -> pd.DataFrame:
     n_recs = max(1, min(2, int(n_recs)))  # only 1 or 2
-    #n_recs = 1
     pool = _candidate_pool(age, salary, cars, exclude_brands)
     if pool.empty:
         return pd.DataFrame()
@@ -305,21 +303,24 @@ with st.expander("Preview customer data (engineered)"):
 # Churn threshold
 st.subheader("Choose churn threshold")
 th = st.slider("Decision threshold for P(churn)", 0.05, 0.95, 0.30, 0.01)
-# ---------- Sidebar: upload live customers to score ----------
-with st.sidebar:
-    st.subheader("Score new customers (CSV)")
-    live_file = st.file_uploader(
-        "Upload customers_to_score.csv (same columns as data.csv; 'Exited' optional)",
-        type=["csv"]
-    )
 
-
- Predict all rows
+# Predict all rows
 X_full = df_fe.drop(columns=["Exited"])
 X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True).reindex(columns=feature_cols, fill_value=0)
 proba_full = rf.predict_proba(X_full_rf)[:,1]
 pred_full  = (proba_full >= th).astype(int)
 
+st.subheader(f"Model summary (threshold = {th:.2f})")
+if "Exited" in df_fe.columns:
+    st.json(summarize(df_fe["Exited"], pred_full, proba_full))
+else:
+    st.info("Labels not available to compute metrics at current threshold.")
+
+# Predictions DF
+pred_df = df_fe.copy()
+pred_df["ChurnProb"] = proba_full
+pred_df["ChurnPred"] = pred_full
+pred_df["CustomerId"] = df_raw["CustomerId"]
 
 # ---------- Sidebar: catalog + controls ----------
 with st.sidebar:
