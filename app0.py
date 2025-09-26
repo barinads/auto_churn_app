@@ -251,11 +251,11 @@ def suggest_car(age: int, estimated_salary: float, cars: pd.DataFrame, *,
 
 # NEW: return 1–2 unique recommendations for a single customer
 def suggest_cars_for_person(age: int, salary: float, cars: pd.DataFrame, *,
-                            n_recs: int = 1, topk: int = 8, tie_eps: float = 0.05,
+                            n_recs: int = 2, topk: int = 8, tie_eps: float = 0.05,
                             diversify_noise: float = 0.02, per_user_seed: Optional[int] = None,
                             exclude_brands: Optional[list[str]] = None) -> pd.DataFrame:
-    #n_recs = max(1, min(2, int(n_recs)))  # only 1 or 2
-    n_recs = 1
+    n_recs = max(1, min(2, int(n_recs)))  # only 1 or 2
+    #n_recs = 1
     pool = _candidate_pool(age, salary, cars, exclude_brands)
     if pool.empty:
         return pd.DataFrame()
