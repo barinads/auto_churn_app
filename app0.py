@@ -281,7 +281,7 @@ def suggest_cars_for_person(age: int, salary: float, cars: pd.DataFrame, *,
 
     # sample up to n unique rows (stable with seed)
     if len(near) <= n_recs:
-        return near[["car_name","brand","segment","style","price_numeric"]].reset_index(drop=True)
+        return near[["car_name","brand","segment","style","car_price"]].reset_index(drop=True)
     picks = near.sample(n=n_recs, random_state=per_user_seed, replace=False)
     return picks[["car_name","brand","segment","style","price_numeric"]].reset_index(drop=True)
 
