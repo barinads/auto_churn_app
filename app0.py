@@ -314,11 +314,11 @@ with st.sidebar:
     )
 
 
-# Predict all rows
-#X_full = df_fe.drop(columns=["Exited"])
-#X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True).reindex(columns=feature_cols, fill_value=0)
-#proba_full = rf.predict_proba(X_full_rf)[:,1]
-#pred_full  = (proba_full >= th).astype(int)
+ Predict all rows
+X_full = df_fe.drop(columns=["Exited"])
+X_full_rf = pd.get_dummies(X_full, columns=cat_cols, drop_first=True).reindex(columns=feature_cols, fill_value=0)
+proba_full = rf.predict_proba(X_full_rf)[:,1]
+pred_full  = (proba_full >= th).astype(int)
 # =======================================================
 # Decide which table to SCORE: live CSV (preferred) or training (demo)
 # =======================================================
